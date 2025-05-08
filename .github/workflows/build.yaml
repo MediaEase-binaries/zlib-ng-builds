@@ -1,0 +1,251 @@
+name: Build zlib-ng
+
+permissions: write-all
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'zlib-ng version to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - '2.0.0'
+          - '2.1.5'
+          - '2.2.4'
+
+jobs:
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generating matrix
+        id: generate
+        run: |
+          pip3 install --upgrade pyyaml
+          echo "Generating matrix..."
+          MATRIX=$(python3 matrix.py)
+          echo "$MATRIX" > matrix.json
+          echo "matrix<<EOF" >> $GITHUB_ENV
+          cat matrix.json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Setup matrix
+        id: set
+        uses: druzsan/setup-matrix@v2
+        with:
+          matrix: |
+            ${{ env.matrix }}
+
+  build:
+    name: v${{ matrix.version }} (${{ matrix.os }})
+    needs: setup-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    container:
+      image: ${{ 
+        startsWith(matrix.os, 'debian-') && (matrix.os == 'debian-11' && 'debian:bullseye' || matrix.os == 'debian-12' && 'debian:bookworm' || 'debian:bookworm') ||
+        startsWith(matrix.os, 'ubuntu-') && format('{0}:{1}', 'ubuntu', matrix.os == 'ubuntu-latest' && 'noble' || matrix.os == 'ubuntu-22.04' && '22.04' || matrix.os == 'ubuntu-24.04' && '24.04' || matrix.os) || '' }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      COMMITTER_NAME: ${{ secrets.COMMITTER_NAME }}
+      COMMITTER_EMAIL: ${{ secrets.COMMITTER_EMAIL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout tools repository
+        uses: actions/checkout@v4
+        with:
+          repository: MediaEase-binaries/tools
+          path: tools
+
+      - name: Update APT
+        run: |
+          upx="upx-ucl"
+          if [ "${{ matrix.os }}" = "debian-12" ]; then
+            echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/sources.list
+            upx="upx-ucl/bookworm-backports"
+          fi
+          apt-get update
+          apt-get install -y apt-transport-https rsync lsb-release curl wget git gzip util-linux \
+            dirmngr software-properties-common gnupg2 ca-certificates gpg-agent dos2unix nfs-common \
+            jq sudo debconf-utils build-essential checkinstall libnss3-tools nano zip \
+            unzip ssl-cert openssl libfcgi0ldbl libtool libcppunit-dev libssl-dev cmake \
+            zlib1g-dev libbz2-dev libreadline-dev libcairo2-dev libcurl4-openssl-dev libgirepository1.0-dev \
+            libncurses5-dev libncursesw5-dev xz-utils tk-dev liblzma-dev $upx \
+            autoconf-archive debian-keyring debian-archive-keyring libicu-dev libgeoip-dev \
+            intltool closure-compiler libnotify4 librsvg2-common xdg-utils pkg-config ninja-build \
+            libdouble-conversion3 python3-dev
+        shell: bash
+
+      - name: Setup variables
+        id: vars
+        run: |
+          echo "build_script=tools/packages/zlib-ng/build.sh" >> $GITHUB_OUTPUT
+          echo "package_name=zlib-ng" >> $GITHUB_OUTPUT
+          echo "metadata_script=tools/generate_metadata.sh" >> $GITHUB_OUTPUT
+          echo "control_file=tools/packages/zlib-ng/control" >> $GITHUB_OUTPUT
+          echo "package_script=tools/generate_package.sh" >> $GITHUB_OUTPUT
+          echo "temp_dir=/tmp/zlib-ng-build/install" >> $GITHUB_OUTPUT
+          for script in $(find tools/ -name "*.sh"); do
+            chmod +x $script
+          done
+
+      - name: Build zlib-ng
+        run: |
+          sed -i "s/@PACKAGE_NAME@/${{ steps.vars.outputs.package_name }}/" ${{ steps.vars.outputs.control_file }}
+          sed -i "s/@MAINTAINER@/${{ secrets.COMMITTER_NAME }} <${{ secrets.COMMITTER_EMAIL }}>/" ${{ steps.vars.outputs.control_file }}
+          ./${{ steps.vars.outputs.build_script }} ${{ matrix.version }}
+
+      - name: Generate metadata
+        run: |
+          mkdir -p artifacts
+          deb_file="$(find / -name "zlib-ng_${{ matrix.version }}*.deb")"
+          cd artifacts
+          echo "Generating metadata for DEB file: $deb_file"
+          ../${{ steps.vars.outputs.metadata_script }} \
+            --category "zlib-ng" \
+            --version "${{ matrix.version }}" \
+            "$deb_file"
+          mv "$deb_file" .
+          ls -l "$(basename "$deb_file" .deb).json"
+
+      - name: Upload as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zlib-ng_${{ matrix.version }}-${{ matrix.os }}
+          path: artifacts/*
+          retention-days: 7
+
+  release:
+    name: Create Releases
+    needs: build
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        version: ['2.0.0', '2.1.5', '2.2.4']
+      fail-fast: false
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Download artifacts for this version
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_artifacts
+          pattern: zlib-ng_${{ matrix.version }}*
+      
+      - name: Prepare release assets
+        id: prepare-release-assets
+        run: |
+          mkdir -p release_assets
+          find downloaded_artifacts -type f \
+            \( -name "zlib-ng_${{ matrix.version }}*.deb" -o \
+              -name "zlib-ng_${{ matrix.version }}*.json" \) \
+            -exec cp {} release_assets/ \;
+          TEMP_DIR=$(mktemp -d)
+          PACKAGES_TABLE="$TEMP_DIR/packages.md"
+          CONFIG_TABLE="$TEMP_DIR/config.md"
+          
+          {
+            echo "| Package | OS | Version |"
+            echo "| ------- | -- | ------- |"
+            for f in release_assets/*.deb; do
+              if [ -f "$f" ]; then
+                pkg=$(basename "$f")
+                os=$(echo "$pkg" | grep -o "debian-[^ _]*\|ubuntu-[^ _]*" || echo "unknown")
+                echo "| $pkg | $os | ${{ matrix.version }} |"
+              fi
+            done
+          } > "$PACKAGES_TABLE"
+
+          {
+            zlib_cmake='-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DZLIB_COMPAT=ON -DZLIB_ENABLE_TESTS=OFF -DWITH_OPTIM=ON -DWITH_NEW_STRATEGIES=ON'
+            echo "| CMake Options |"
+            echo "| ------------- |"
+            echo "| \`${zlib_cmake}\` |"
+          } > "$CONFIG_TABLE"
+
+          echo "packages_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$PACKAGES_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "config_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$CONFIG_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          rm -rf "$TEMP_DIR"
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ matrix.version }}
+          name: zlib-ng ${{ matrix.version }}
+          files: |
+            release_assets/*
+          draft: false
+          prerelease: ${{ steps.prepare-release-assets.outputs.prerelease }}
+          generate_release_notes: true
+          body: |
+            # zlib-ng v${{ matrix.version }}
+
+            Pre-built zlib-ng packages for various Linux distributions.
+
+            ## 🎯 Features
+
+            - Pre-compiled zlib-ng library
+            - Multiple distribution support
+            - Automated builds via GitHub Actions
+            - JSON metadata for automated installations
+            - Optimized for MediaEase applications
+
+            ## 📦 Available Packages
+
+            ${{ steps.prepare-release-assets.outputs.packages_table }}
+
+            ## 🔧 Build Configuration
+
+            ${{ steps.prepare-release-assets.outputs.config_table }}
+
+            ## 📋 Installation
+
+            ### Manual Installation
+            1. Download the appropriate .deb package for your distribution
+            2. Install using: `sudo dpkg -i package_name.deb`
+            3. Fix any dependencies if needed: `sudo apt-get install -f`
+
+            ## 🔍 Package Details
+
+            The packages include:
+            - zlib-ng library
+            - Development files
+            - System-wide installation in `/usr`
+
+            ## 📄 Metadata
+
+            Each package is accompanied by its JSON metadata file containing:
+            - Package information
+            - Checksums
+            - Dependencies
+            - Build configuration
+            - Distribution details
+
+            ## 📝 License
+
+            zlib-ng is distributed under the [zlib License](https://github.com/zlib-ng/zlib-ng/blob/develop/LICENSE.md).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
